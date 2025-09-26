@@ -1,16 +1,15 @@
 # -*- coding: utf-8 -*-
-# pip install streamlit pandas openpyxl
+# pip install streamlit pandas openpyxl msal requests
 import streamlit as st
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-import unicodedata
+import unicodedata, json, requests
+import msal
 
 # ===================== CONFIG =====================
-DATA_DIR = Path(".")  # sin secrets: usa la carpeta del script
+DATA_DIR = Path(".")  # CANDIDATOS.xlsx desde el repo
 FILE_CAND  = DATA_DIR / "CANDIDATOS.xlsx"
-FILE_TOK   = DATA_DIR / "TOKEN.xlsx"
-FILE_VOTOS = DATA_DIR / "VOTOS.xlsx"
 MAX_SEL = 6
 
 APP_TITLE = "Votación representantes Comité Paritario de Higiene y Seguridad Nivel Central"
@@ -25,11 +24,18 @@ if "done" not in st.session_state:
     st.session_state.done = False
 if "token_in" not in st.session_state:
     st.session_state.token_in = ""
-# selección global persistente
 if "selected_ids" not in st.session_state:
     st.session_state.selected_ids = set()
 
-# ===================== HELPERS =====================
+# ===================== UTILIDADES =====================
+def _strip_accents(s: str) -> str:
+    if s is None: return ""
+    s = unicodedata.normalize("NFD", str(s))
+    return "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+
+def _normalize_token(s: str) -> str:
+    return str(s or "").upper().replace(" ", "").replace("-", "").strip()
+
 def pick_col(df: pd.DataFrame, names):
     low = {c.strip().lower(): c for c in df.columns}
     for n in names:
@@ -37,23 +43,99 @@ def pick_col(df: pd.DataFrame, names):
             return low[n.strip().lower()]
     return None
 
-def _strip_accents(s: str) -> str:
-    if s is None:
-        return ""
-    s = unicodedata.normalize("NFD", str(s))
-    return "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+# ===================== MICROSOFT GRAPH =====================
+# Config esperada en Streamlit Secrets:
+# TENANT_ID, CLIENT_ID, CLIENT_SECRET
+# GRAPH_SITE_ID, GRAPH_LIST_TOKENS_ID, GRAPH_LIST_VOTOS_ID
+GRAPH_SCOPE = ["https://graph.microsoft.com/.default"]
+GRAPH_BASE  = "https://graph.microsoft.com/v1.0"
 
-def norm_bool_series(s: pd.Series):
-    # robusto a tildes/espacios/upper y variantes de “sí”
-    t = s.astype(str).str.strip().str.lower().map(_strip_accents)
-    return t.isin(["true","1","yes","si","x"])
+@st.cache_resource(show_spinner=False)
+def _graph_token():
+    app = msal.ConfidentialClientApplication(
+        client_id=st.secrets["CLIENT_ID"],
+        authority=f"https://login.microsoftonline.com/{st.secrets['TENANT_ID']}",
+        client_credential=st.secrets["CLIENT_SECRET"],
+    )
+    result = app.acquire_token_silent(GRAPH_SCOPE, account=None)
+    if not result:
+        result = app.acquire_token_for_client(scopes=GRAPH_SCOPE)
+    if "access_token" not in result:
+        raise RuntimeError(f"Graph auth failed: {result}")
+    return result["access_token"]
 
-def ensure_cols(df: pd.DataFrame, needed: dict):
-    for c, default in needed.items():
-        if c not in df.columns:
-            df[c] = default
-    return df
+def _gheaders():
+    return {"Authorization": f"Bearer {_graph_token()}","Content-Type":"application/json"}
 
+def _sp_list_items(list_id: str, params: dict):
+    url = f"{GRAPH_BASE}/sites/{st.secrets['GRAPH_SITE_ID']}/lists/{list_id}/items"
+    r = requests.get(url, headers=_gheaders(), params=params, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def _sp_get_item(list_id: str, item_id: str):
+    url = f"{GRAPH_BASE}/sites/{st.secrets['GRAPH_SITE_ID']}/lists/{list_id}/items/{item_id}"
+    r = requests.get(url, headers=_gheaders(), timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def _sp_patch_item_fields(list_id: str, item_id: str, fields: dict):
+    url = f"{GRAPH_BASE}/sites/{st.secrets['GRAPH_SITE_ID']}/lists/{list_id}/items/{item_id}/fields"
+    r = requests.patch(url, headers=_gheaders(), data=json.dumps(fields), timeout=30)
+    r.raise_for_status()
+    return True
+
+def _sp_add_item(list_id: str, fields: dict):
+    url = f"{GRAPH_BASE}/sites/{st.secrets['GRAPH_SITE_ID']}/lists/{list_id}/items"
+    body = {"fields": fields}
+    r = requests.post(url, headers=_gheaders(), data=json.dumps(body), timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+# ------- Lógica de tokens/votos sobre Microsoft Lists -------
+def token_get_item(token_norm: str):
+    # Filtra por Title == token (usa columna "Title" para guardar el token)
+    # Si tu lista usa otro campo para token, cambia fields/Title por fields/<NombreCampo>
+    params = {
+        "$filter": f"fields/Title eq '{token_norm}'",
+        "$select": "id,fields",
+        "$top": "1",
+    }
+    data = _sp_list_items(st.secrets["GRAPH_LIST_TOKENS_ID"], params)
+    items = data.get("value", [])
+    return items[0] if items else None
+
+def token_is_used(token_norm: str) -> bool:
+    item = token_get_item(token_norm)
+    if not item:  # token no existe => inválido
+        return False
+    fields = item.get("fields", {})
+    val = str(fields.get("Usado", "")).strip().lower()
+    return val in ["true","1","yes","si","sí","x","used"]
+
+def mark_token_used(token_norm: str, fecha_iso: str):
+    item = token_get_item(token_norm)
+    if not item:
+        raise ValueError("Token no encontrado en la lista TOKEN.")
+    item_id = item["id"]
+    return _sp_patch_item_fields(
+        st.secrets["GRAPH_LIST_TOKENS_ID"],
+        item_id,
+        {"Usado": True, "FechaUso": fecha_iso}
+    )
+
+def append_vote(token_norm: str, seleccion_ids, seleccion_nombres, cantidad: int, fecha_iso: str):
+    fields = {
+        # Puedes renombrar estos campos en tu lista VOTOS; ajusta los nombres aquí
+        "Token": token_norm,
+        "SeleccionadosIDs": ";".join(seleccion_ids),
+        "SeleccionadosNombres": "; ".join(seleccion_nombres),
+        "Cantidad": cantidad,
+        "Fecha": fecha_iso,
+    }
+    return _sp_add_item(st.secrets["GRAPH_LIST_VOTOS_ID"], fields)
+
+# ===================== CANDIDATOS desde Excel =====================
 @st.cache_data
 def load_candidatos():
     df = pd.read_excel(FILE_CAND, dtype=str)
@@ -88,12 +170,12 @@ def load_candidatos():
     else:
         df["__id__"] = (df.index + 1).astype(str)
 
-    # ===== Voluntarios (columna "Voluntario" o última columna como respaldo) =====
+    # Voluntario (columna "Voluntario" o última)
     col_vol = pick_col(df, ["Voluntario","VOLUNTARIO"])
     if col_vol is None:
-        # fallback: si no encontró por nombre, usa la última columna
         col_vol = df.columns[-1]
-    df["__vol__"] = norm_bool_series(df[col_vol].fillna(""))
+    t = df[col_vol].astype(str).map(_strip_accents).str.strip().str.lower()
+    df["__vol__"] = t.isin(["true","1","yes","si","x","sí","sí","si"])
 
     df["__div__"]   = df[col_div].astype(str).str.strip() if col_div else ""
     base_label      = df[col_label].astype(str).str.strip()
@@ -101,54 +183,17 @@ def load_candidatos():
     df.loc[df["__vol__"] == True, "__label__"] = df.loc[df["__vol__"] == True, "__label__"] + "  [Voluntario]"
 
     df = df[df["__label__"].str.len() > 0].copy()
-    # voluntarios primero
     df = df.sort_values(by=["__vol__", "__label__"], ascending=[False, True])
     return df[["__id__", "__label__", "__div__", "__vol__"]].reset_index(drop=True)
 
-@st.cache_data
-def load_tokens():
-    df = pd.read_excel(FILE_TOK, dtype=str)
-    c_tok  = pick_col(df, ["TOKEN", "token", "Token", "código", "codigo", "Código de acceso", "Codigo de acceso"])
-    c_used = pick_col(df, ["Usado", "usado", "USED"])
-    c_fuso = pick_col(df, ["FechaUso", "FechaU", "fechauso", "fecha u", "fecha u."])
-    c_mail = pick_col(df, ["Correo electrónico institucional", "Correo electronico institucional", "correo"])
-    if c_tok is None:
-        raise ValueError("TOKEN.xlsx debe tener una columna con el código (por ejemplo 'TOKEN').")
-    rename = {c_tok: "token"}
-    if c_used: rename[c_used] = "Usado"
-    if c_fuso: rename[c_fuso] = "FechaUso"
-    if c_mail: rename[c_mail] = "correo"
-    df = df.rename(columns=rename)
-    if "correo" in df.columns:
-        df["correo"] = df["correo"].astype(str).str.strip().str.lower()
-    else:
-        df["correo"] = ""
-    df["token"] = (df["token"].astype(str).str.strip().str.upper()
-                   .str.replace(" ", "", regex=False).str.replace("-", "", regex=False))
-    df = ensure_cols(df, {"Usado":"", "FechaUso":""})
-    return df
-
-def save_tokens(df):
-    cols = ["token","correo","Usado","FechaUso"]
-    for c in cols:
-        if c not in df.columns: df[c] = ""
-    df[cols].to_excel(FILE_TOK, index=False)
-
-def load_votes():
-    if FILE_VOTOS.exists():
-        return pd.read_excel(FILE_VOTOS, dtype=str)
-    return pd.DataFrame(columns=["Token","SeleccionadosIDs","SeleccionadosNombres","Cantidad","Fecha"])
-
-def save_votes(df):
-    df.to_excel(FILE_VOTOS, index=False)
-
-# ===================== PANTALLA 0: YA VOTÓ =====================
+# ===================== PANTALLAS =====================
+# 0: ya votó
 if st.session_state.done:
     st.success("¡Gracias por votar! ✅ Tu respuesta fue registrada.")
     st.caption("Puedes cerrar esta ventana. Si necesitas asistencia, contacta al equipo organizador.")
     st.stop()
 
-# ===================== PANTALLA 1: LOGIN CON CÓDIGO =====================
+# 1: login
 if not st.session_state.auth:
     st.subheader("Acceso")
     st.caption("Tu **código de acceso** te llegó por correo. Es personal y de **un solo uso**.")
@@ -161,22 +206,16 @@ if not st.session_state.auth:
     if not submit:
         st.stop()
 
-    token_in = raw.upper().replace(" ", "").replace("-", "").strip()
+    token_in = _normalize_token(raw)
     if not token_in:
         st.error("Debes ingresar tu código de acceso.")
         st.stop()
 
-    try:
-        tok = load_tokens()
-    except Exception as e:
-        st.error(f"No se pudo cargar TOKEN.xlsx: {e}")
-        st.stop()
-
-    row = tok.loc[tok["token"] == token_in]
-    if row.empty:
+    item = token_get_item(token_in)
+    if not item:
         st.error("Código de acceso inválido.")
         st.stop()
-    if str(row.iloc[0].get("Usado","")).strip().lower() in ["true","1","yes","si","sí","x","used"]:
+    if token_is_used(token_in):
         st.error("Este código de acceso ya fue usado.")
         st.stop()
 
@@ -185,7 +224,7 @@ if not st.session_state.auth:
     st.success("Código de acceso válido ✅")
     st.rerun()
 
-# ===================== PANTALLA 2: PAPELETA =====================
+# 2: papeleta
 token_in = st.session_state.token_in
 cand = load_candidatos()
 
@@ -209,10 +248,8 @@ if solo_vol:
 
 st.write(f"**Coincidencias:** {len(base)}")
 
-# ---- Persistencia de selección a través de filtros ----
 label_map = dict(zip(cand["__id__"].astype(str), cand["__label__"]))
-
-df_view = base[["__label__", "__id__"]].rename(columns={"__label__": "Candidato", "__id__": "ID"}).copy()
+df_view = base[["__label__", "__id__"]].rename(columns={"__label__":"Candidato","__id__":"ID"}).copy()
 df_view["ID"] = df_view["ID"].astype(str)
 df_view["Elegir"] = df_view["ID"].apply(lambda x: x in st.session_state.selected_ids)
 
@@ -235,16 +272,12 @@ edited = st.data_editor(
 )
 
 edited["ID"] = edited["ID"].astype(str)
-
 antes = set(st.session_state.selected_ids)
-
 ids_en_vista = set(edited["ID"].tolist())
 marcados_en_vista = set(edited.loc[edited["Elegir"] == True, "ID"].tolist())
-
 st.session_state.selected_ids -= (ids_en_vista - marcados_en_vista)
 st.session_state.selected_ids |= marcados_en_vista
 st.session_state.selected_ids &= set(cand["__id__"].astype(str).tolist())
-
 if st.session_state.selected_ids != antes:
     st.rerun()
 
@@ -259,22 +292,17 @@ if len(seleccion_ids) > MAX_SEL:
 enviar = st.button("Enviar voto", type="primary", disabled=(len(seleccion_ids)==0))
 
 if enviar:
-    votos = load_votes()
-    ahora = datetime.now().isoformat(timespec="seconds")
-    nuevo = pd.DataFrame([{
-        "Token": token_in,
-        "SeleccionadosIDs": ";".join(seleccion_ids),
-        "SeleccionadosNombres": "; ".join(label_clean),
-        "Cantidad": str(len(seleccion_ids)),
-        "Fecha": ahora,
-    }])
-    votos = pd.concat([votos, nuevo], ignore_index=True)
-    save_votes(votos)
+    # doble verificación anti-replay
+    if token_is_used(token_in):
+        st.error("Este código de acceso ya fue usado.")
+        st.stop()
 
-    tok = load_tokens()
-    tok.loc[tok["token"] == token_in, "Usado"] = "True"
-    tok.loc[tok["token"] == token_in, "FechaUso"] = ahora
-    save_tokens(tok)
+    ahora = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    # 1) guardar voto
+    append_vote(token_in, seleccion_ids, label_clean, len(seleccion_ids), ahora)
+    # 2) marcar token usado
+    mark_token_used(token_in, ahora)
 
     st.session_state.done = True
     st.success("¡Voto registrado correctamente! ✅")
