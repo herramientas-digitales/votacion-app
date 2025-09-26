@@ -4,9 +4,10 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 from pathlib import Path
+import unicodedata
 
 # ===================== CONFIG =====================
-DATA_DIR = Path(".")
+DATA_DIR = Path(".")  # sin secrets: usa la carpeta del script
 FILE_CAND  = DATA_DIR / "CANDIDATOS.xlsx"
 FILE_TOK   = DATA_DIR / "TOKEN.xlsx"
 FILE_VOTOS = DATA_DIR / "VOTOS.xlsx"
@@ -24,6 +25,9 @@ if "done" not in st.session_state:
     st.session_state.done = False
 if "token_in" not in st.session_state:
     st.session_state.token_in = ""
+# selección global persistente
+if "selected_ids" not in st.session_state:
+    st.session_state.selected_ids = set()
 
 # ===================== HELPERS =====================
 def pick_col(df: pd.DataFrame, names):
@@ -33,8 +37,16 @@ def pick_col(df: pd.DataFrame, names):
             return low[n.strip().lower()]
     return None
 
+def _strip_accents(s: str) -> str:
+    if s is None:
+        return ""
+    s = unicodedata.normalize("NFD", str(s))
+    return "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+
 def norm_bool_series(s: pd.Series):
-    return s.astype(str).str.strip().str.lower().isin(["true","1","yes","si","sí","x"])
+    # robusto a tildes/espacios/upper y variantes de “sí”
+    t = s.astype(str).str.strip().str.lower().map(_strip_accents)
+    return t.isin(["true","1","yes","si","x"])
 
 def ensure_cols(df: pd.DataFrame, needed: dict):
     for c, default in needed.items():
@@ -76,8 +88,12 @@ def load_candidatos():
     else:
         df["__id__"] = (df.index + 1).astype(str)
 
+    # ===== Voluntarios (columna "Voluntario" o última columna como respaldo) =====
     col_vol = pick_col(df, ["Voluntario","VOLUNTARIO"])
-    df["__vol__"] = norm_bool_series(df[col_vol].fillna("")) if col_vol else False
+    if col_vol is None:
+        # fallback: si no encontró por nombre, usa la última columna
+        col_vol = df.columns[-1]
+    df["__vol__"] = norm_bool_series(df[col_vol].fillna(""))
 
     df["__div__"]   = df[col_div].astype(str).str.strip() if col_div else ""
     base_label      = df[col_label].astype(str).str.strip()
@@ -85,6 +101,7 @@ def load_candidatos():
     df.loc[df["__vol__"] == True, "__label__"] = df.loc[df["__vol__"] == True, "__label__"] + "  [Voluntario]"
 
     df = df[df["__label__"].str.len() > 0].copy()
+    # voluntarios primero
     df = df.sort_values(by=["__vol__", "__label__"], ascending=[False, True])
     return df[["__id__", "__label__", "__div__", "__vol__"]].reset_index(drop=True)
 
@@ -163,15 +180,13 @@ if not st.session_state.auth:
         st.error("Este código de acceso ya fue usado.")
         st.stop()
 
-    # OK → guardar en sesión y pasar a la papeleta
     st.session_state.token_in = token_in
     st.session_state.auth = True
     st.success("Código de acceso válido ✅")
-    st.rerun()   # 👈 ahora sí funciona
+    st.rerun()
 
 # ===================== PANTALLA 2: PAPELETA =====================
 token_in = st.session_state.token_in
-
 cand = load_candidatos()
 
 st.subheader("Papeleta")
@@ -194,11 +209,16 @@ if solo_vol:
 
 st.write(f"**Coincidencias:** {len(base)}")
 
-df_view = base[["__label__", "__id__"]].rename(columns={"__label__": "Candidato", "__id__": "ID"})
-df_view["Elegir"] = False
+# ---- Persistencia de selección a través de filtros ----
+label_map = dict(zip(cand["__id__"].astype(str), cand["__label__"]))
+
+df_view = base[["__label__", "__id__"]].rename(columns={"__label__": "Candidato", "__id__": "ID"}).copy()
+df_view["ID"] = df_view["ID"].astype(str)
+df_view["Elegir"] = df_view["ID"].apply(lambda x: x in st.session_state.selected_ids)
 
 edited = st.data_editor(
     df_view,
+    key="grid_candidatos",
     hide_index=True,
     column_config={
         "Elegir": st.column_config.CheckboxColumn(
@@ -214,9 +234,22 @@ edited = st.data_editor(
     height=420,
 )
 
-sel_df = edited[edited["Elegir"] == True]
-seleccion_ids = sel_df["ID"].tolist()
-label_clean = sel_df["Candidato"].tolist()
+edited["ID"] = edited["ID"].astype(str)
+
+antes = set(st.session_state.selected_ids)
+
+ids_en_vista = set(edited["ID"].tolist())
+marcados_en_vista = set(edited.loc[edited["Elegir"] == True, "ID"].tolist())
+
+st.session_state.selected_ids -= (ids_en_vista - marcados_en_vista)
+st.session_state.selected_ids |= marcados_en_vista
+st.session_state.selected_ids &= set(cand["__id__"].astype(str).tolist())
+
+if st.session_state.selected_ids != antes:
+    st.rerun()
+
+seleccion_ids = list(st.session_state.selected_ids)
+label_clean   = [label_map.get(x, x) for x in seleccion_ids]
 
 st.markdown(f"**Seleccionados:** {len(seleccion_ids)} / {MAX_SEL}")
 if len(seleccion_ids) > MAX_SEL:
@@ -247,3 +280,4 @@ if enviar:
     st.success("¡Voto registrado correctamente! ✅")
     st.balloons()
     st.rerun()
+
